@@ -175,6 +175,7 @@ static bool compat_group(VkExtensionProperties *ep, uint32_t ne, uint32_t api, i
 }
 
 static bool env_on(const char *name) { const char *v = getenv(name); return v && atoi(v); }
+bool vk_driver_is_turnip(void);  // (defined below: the gpu-heap automatic looks at the driver before that)
 
 // ---- synchronization2 without it (Mali's older drivers): Vulkan 1.0's barriers, submissions and timestamps. The
 // stage / access bits below 32 are 1.0's own; the split-up ones above map to the 1.0 bit they came from. (From LAS
@@ -1682,7 +1683,15 @@ bool vk_adreno_8xx(const char *name) {
     return n >= 800 && n < 900;
 }
 // A Turnip path's setting (-1 Automatic, 1 on, 0 off) for this GPU
-bool vk_turnip_path_on(int setting) { return setting < 0 ? vk_adreno_8xx(g_vk.props.deviceName) : setting != 0; }
+bool vk_turnip_path_on(int setting) {
+    if (setting >= 0) return setting != 0;
+    if (vk_adreno_8xx(g_vk.props.deviceName)) return true;
+    // Turnip names an Adreno 732 "Adreno (TM) 735", and vk_adreno_8xx takes that for a pre-8xx GPU: the heap stayed
+    // off, and the game's text glyphs (a buffer ~2.7 GB into the 3 GB heap, outside any storage descriptor's reach)
+    // read as zeros - every menu, dialogue and item name blank. A Turnip that can place the heap in GPU memory is
+    // meant to be on for those paths: without it the game is unreadable on such a GPU.
+    return g_vk.map_placed && vk_driver_is_turnip();
+}
 static bool g_lrz_at_start = true;
 bool vk_lrz_at_start(void) { return g_lrz_at_start; }  // (the start screen: a change needs a restart)
 const char *vk_gpu_name(void) { return g_vk.props.deviceName; }
