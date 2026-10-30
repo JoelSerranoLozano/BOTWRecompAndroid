@@ -316,6 +316,27 @@ Por bloque, los de un solo offset son vértice b4 56 %, b8 26 %, b9 10 %, b5 5 %
 
 ---
 
+## 7. Estado (30-10-2026, madrugada) y siguientes pasos
+
+- **Commit `186e38d`** (subido a `origin/s23-rendimiento`): todo lo anterior. Con los valores por defecto (sync lag apagado): **~25 fps** con el móvil templado.
+- **Merge con el `main` del autor (0.2.4)**, en la copia de trabajo, sin commit:
+  - conflictos resueltos en `exec.c` / `device.c`;
+  - mi regla de "leer en el sitio" solo para la 740 se sustituye por la del autor (7315a62), que ya la cubre;
+  - las etiquetas de Automático del lanzador siguen esa regla;
+  - probado: 23,6 fps, imagen y agua bien, memoria en la GPU apagada por su umbral de 7 GiB (el S23 reporta 7074 MB), `GAMELIB_ID` sin cambios.
+- **Cuelgue al salir por el menú del recomp** (lo reportó el usuario):
+  - **"Cerrar la app"**: en mi prueba sale limpio (`_exit(0)`, sin *tombstone*).
+  - **"Volver al inicio" + "Jugar"**: dos listas mías (`slot_out` de las casillas ordenadas y `gc_back` de las copias de vuelta), y también las escrituras de vuelta y los contadores pendientes, apuntaban a memoria del juego anterior que el reinicio libera.
+  - Ahora se descartan en el reinicio (sin commit).
+  - Probado el ciclo entrar → volver al inicio → jugar → **de vuelta en el mundo** (imagen y agua bien, ~17 fps con el móvil templado), sin cuelgue. Falta confirmarlo jugando un rato normal.
+- **PR al autor: en espera** hasta comprobar la estabilidad. La descripción está preparada (fuera del repo, en `~/botw_s23_pendiente/`).
+- **Siguiente idea: medir la memoria del juego en la GPU antes de construirla.**
+  - Cómo: reiniciar el móvil y arrancar con `LARECOMP_HEAP_ANY_RAM=1` + `gpu_heap = 1`.
+  - Si Android no la cierra, comparar con el modo copia. Quitaría sobre todo trabajo de CPU; la GPU sigue siendo el límite.
+  - Solo si gana claramente: reservar la memoria por trozos.
+
+---
+
 ## English summary (for the author)
 
 **Galaxy S23 (SM-S911B, Adreno 740, 8 GB), Turnip v26, game 1.0.0, open world.** Release 0.2.1: 5–6 fps. Now: **~23 fps with correct visuals (sync lag off)** on a cool phone, ~13–15 fps once Samsung's SSRM caps the GPU at ~300 MHz (it does within 3–5 min, even unplugged). All numbers are in-run A/Bs (`LARECOMP_AB`) unless noted.

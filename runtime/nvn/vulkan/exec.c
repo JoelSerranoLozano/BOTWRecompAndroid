@@ -5283,6 +5283,21 @@ static int g_cs_n;  // (compute program table below)
 // address (the old Prog / Pipe objects are leaked, so pipeline keys holding their pointers can't collide), compute
 // programs, shared copies - and the heap import: its pages are replaced (re-imported on first use).
 void vk_exec_reset(void) {
+    {   // What is still pending for the old game points into its memory - copy-backs (and the arena shadows they read,
+        // freed by gres_reset below), write-backs, counters: dropped, not applied into the next game's once it boots
+        // in the same process (Quit -> Return to start, then Play). The GPU is idle here (backend_reset).
+#ifdef __ANDROID__
+        pthread_mutex_lock(&gc_lock);
+        gc_nback = 0;
+        pthread_mutex_unlock(&gc_lock);
+#endif
+        pthread_mutex_lock(&wb_lock);
+        for (int i = 0; i < WB_SLOTS; i++) wb_ent[i].busy = false;
+        pthread_mutex_unlock(&wb_lock);
+        pthread_mutex_lock(&cq_lock);
+        for (int i = 0; i < SUBS; i++) cq[i].n = 0, cq[i].ts = false;
+        pthread_mutex_unlock(&cq_lock);
+    }
     memset(prog_tab, 0, sizeof prog_tab);
     memset(pipe_tab, 0, sizeof pipe_tab);
     g_cs_n = 0;

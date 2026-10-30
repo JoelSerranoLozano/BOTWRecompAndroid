@@ -1247,6 +1247,12 @@ static void tex_slot_apply(void *arg) {  // (the render thread's copy of the slo
     }
     free(s);
 }
+// (a reboot: the old game's textures are all freed by textures_reset - the ones waiting here are dropped, not retired)
+RT_ON_RESET(slot_out_reset) {
+    pthread_mutex_lock(&slot_out_lock);
+    slot_nout = 0;
+    pthread_mutex_unlock(&slot_out_lock);
+}
 static void slot_out_retire(void) {  // (a game thread, holding no lock)
     NvnTexture *batch[256];
     for (;;) {
