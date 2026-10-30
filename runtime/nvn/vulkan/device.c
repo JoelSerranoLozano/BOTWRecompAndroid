@@ -445,6 +445,15 @@ void vk_device_fault_report(void) {
             (unsigned long long)vend[i].vendorFaultData);
 }
 
+// The pipeline cache's file (+ suffix): its own when Turnip's shader preambles are off (IR3_SHADER_DEBUG nopreamble,
+// ui_window_init) - the driver's cache keys don't change with that flag, so pipelines built with them would be loaded
+static const char *vk_pcache_path(const char *suffix) {
+    static char p[64];
+    const char *d = getenv("IR3_SHADER_DEBUG");
+    snprintf(p, sizeof p, "cache/vk_pipelines%s.bin%s", d && strstr(d, "nopreamble") ? "_np" : "", suffix);
+    return p;
+}
+
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
@@ -830,7 +839,7 @@ static void create_device(void) {
     // read nor written - every pipeline compiled cold, for measuring)
     size_t sz = 0;
     void *data = NULL;
-    FILE *fp = getenv("LARECOMP_VK_NO_PIPELINE_CACHE") ? NULL : fopen("cache/vk_pipelines.bin", "rb");
+    FILE *fp = getenv("LARECOMP_VK_NO_PIPELINE_CACHE") ? NULL : fopen(vk_pcache_path(""), "rb");
     if (fp) {
 #ifdef __ANDROID__  // (a size cap and the public header checked: a file from another driver or a cut-off write)
         long length = -1;
@@ -871,11 +880,13 @@ void vk_pipeline_cache_save(void) {
     void *data = malloc(sz);
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
         mkdir("cache", 0755);
-        FILE *f = fopen("cache/vk_pipelines.bin.tmp", "wb");
+        char tmp[64];
+        snprintf(tmp, sizeof tmp, "%s", vk_pcache_path(".tmp"));
+        FILE *f = fopen(tmp, "wb");
         if (f) {
             bool ok = fwrite(data, 1, sz, f) == sz;
             fclose(f);
-            if (ok) { remove("cache/vk_pipelines.bin"); rename("cache/vk_pipelines.bin.tmp", "cache/vk_pipelines.bin"); }
+            if (ok) { remove(vk_pcache_path("")); rename(tmp, vk_pcache_path("")); }
         }
     }
     free(data);
@@ -1078,8 +1089,13 @@ bool vk_frame_begin(const float clear[4]) {
     bool timing = vk_timing_trace_on();
     uint64_t trace_start = timing ? SDL_GetTicksNS() : 0;
 #endif
+#ifdef __ANDROID__
+    extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (exec.c: LARECOMP_FRAME_TIMELINE)
+    vk_tl("render: frame slot wait begin", slot_seq[slot], 0);
+#endif
     vk_wait_seq(slot_seq[slot]);
 #ifdef __ANDROID__
+    vk_tl("render: frame slot wait end", slot_seq[slot], 0);
     if (timing) vk_timing_trace_wait(VK_TIMING_SLOT, SDL_GetTicksNS() - trace_start);
     trace_start = timing ? SDL_GetTicksNS() : 0;
 #endif
@@ -1100,6 +1116,7 @@ bool vk_frame_begin(const float clear[4]) {
         if (r == VK_TIMEOUT || r == VK_NOT_READY) { LOG("[vk] still no window image: frame skipped\n"); return false; }
     }
 #ifdef __ANDROID__
+    vk_tl("render: acquired window image", cur_frame.image, 0);
     if (timing) vk_timing_trace_wait(VK_TIMING_ACQUIRE, SDL_GetTicksNS() - trace_start);
     if (r == VK_ERROR_SURFACE_LOST_KHR) { surface_lost = true; return false; }  // (made again at the next frame)
 #endif
@@ -1397,6 +1414,16 @@ void backend_present(NvnTexture *t) {
             if (at == (long)total_frames) { g_gpuprof_frame = true; break; }
             if (*p == ',') p++; else break;
         }
+#ifdef __ANDROID__
+        // (measurements from outside, at the moment wanted: a file "prof_gpu" in the data folder profiles the next
+        // frame as LARECOMP_GPUPROF_AT, "prof_timeline" records LARECOMP_FRAME_TIMELINE's four frames from the next;
+        // each file is removed once seen - adb shell touch <data folder>/prof_gpu. Looked for every 15 frames.)
+        if (!(total_frames % 15)) {
+            extern void vk_tl_arm(void);
+            if (!access("prof_gpu", F_OK)) { unlink("prof_gpu"); g_gpuprof_frame = true; LOG("[gpuprof] asked for: frame %llu\n", (unsigned long long)total_frames); }
+            if (!access("prof_timeline", F_OK)) { unlink("prof_timeline"); vk_tl_arm(); LOG("[timeline] asked for: from frame %llu\n", (unsigned long long)total_frames + 1); }
+        }
+#endif
     }
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)total_frames);
     {   // LARECOMP_CAM_PROJ=<hex address> (a widescreen test): a sead::PerspectiveProjection there (1.8.2's main camera
@@ -1676,8 +1703,26 @@ bool vk_adreno_8xx(const char *name) {
     int n = atoi(a);
     return n >= 800 && n < 900;
 }
+bool vk_adreno_7xx(const char *name) {  // (as vk_adreno_8xx)
+    const char *a = name ? strstr(name, "Adreno") : NULL;
+    if (!a) return false;
+    while (*a && (*a < '0' || *a > '9')) a++;
+    int n = atoi(a);
+    return n >= 700 && n < 800;
+}
 // A Turnip path's setting (-1 Automatic, 1 on, 0 off) for this GPU
 bool vk_turnip_path_on(int setting) { return setting < 0 ? vk_adreno_8xx(g_vk.props.deviceName) : setting != 0; }
+// Draw-target reads in place (exec.c resolve_feedback): Automatic is on for the Adreno 740 too, where they were checked
+// with the sync lag off - water, ground, decals and lighting right - and saved the frame's 11 feedback copies: 53.9 ->
+// 47.8 ms a frame, +12% (S23, 1.0.0, 2026-10-29). Not the other 7xx: a 750 drew LAS's text and colours wrong with
+// LASRecompAndroid's fast paths.
+bool vk_adreno_inplace_auto(const char *name) {
+    const char *a = name ? strstr(name, "Adreno") : NULL;
+    if (!a) return false;
+    while (*a && (*a < '0' || *a > '9')) a++;
+    return vk_adreno_8xx(name) || atoi(a) == 740;
+}
+bool vk_turnip_inplace_on(int setting) { return setting < 0 ? vk_adreno_inplace_auto(g_vk.props.deviceName) : setting != 0; }
 static bool g_lrz_at_start = true;
 bool vk_lrz_at_start(void) { return g_lrz_at_start; }  // (the start screen: a change needs a restart)
 const char *vk_gpu_name(void) { return g_vk.props.deviceName; }
@@ -1715,6 +1760,29 @@ void ui_window_init(void) {
         LOG("[vk] Turnip LRZ %s (%s%s)%s%s\n", lrz ? "on" : "off", g_settings.turnip_lrz < 0 ? "automatic: " : "settings",
             g_settings.turnip_lrz < 0 ? (model[0] ? model : "GPU unknown") : "", getenv("TU_DEBUG") ? ", TU_DEBUG=" : "",
             getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "");
+        // Turnip's shader compiler (ir3) moves what depends only on constants into a preamble that runs once per draw.
+        // With BOTW's ~4,000 small draws a frame, that step costs more than it saves: off, the G-buffer went from 23.0 to
+        // 19.8 ms and the open world from 14.85 to 16.65 fps on an Adreno 740 (S23, 1.0.0, control / off / off /
+        // control runs, GPU pinned at 295 MHz, 2026-10-30; the scene the same each run). Automatic: off on the Adreno
+        // 7xx, where it was measured. LARECOMP_IR3_PREAMBLE=1 keeps them, =0 drops them on any GPU; an IR3_SHADER_DEBUG
+        // already set is left as it is. Pipelines built without them have a cache file of their own (vk_pcache_path).
+        {
+            if (!model[0]) {
+                FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r");
+                if (f) {
+                    if (!fgets(model, sizeof model, f)) model[0] = 0;
+                    fclose(f);
+                    model[strcspn(model, "\r\n")] = 0;
+                }
+                if (!model[0]) snprintf(model, sizeof model, "%s", g_settings.gpu_model);
+            }
+            const char *e = getenv("LARECOMP_IR3_PREAMBLE");
+            bool drop = e ? atoi(e) == 0 : vk_adreno_7xx(model);
+            if (drop && !getenv("IR3_SHADER_DEBUG")) setenv("IR3_SHADER_DEBUG", "nopreamble", 1);
+            LOG("[vk] Turnip shader preambles %s (%s)%s%s\n", drop ? "off" : "on",
+                e ? "LARECOMP_IR3_PREAMBLE" : model[0] ? model : "GPU unknown",
+                getenv("IR3_SHADER_DEBUG") ? ", IR3_SHADER_DEBUG=" : "", getenv("IR3_SHADER_DEBUG") ? getenv("IR3_SHADER_DEBUG") : "");
+        }
     }
 #endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());

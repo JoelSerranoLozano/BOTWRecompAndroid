@@ -116,6 +116,13 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         else if (mode == RES_Q50) share = 0.5;
         if (mode != RES_MATCH) hs = fmin(base * share, hs);
     }
+    {   // LARECOMP_AB=<n>:scale (a measurement): the scene at LARECOMP_AB_SCALE in the odd stretches (its own 900 lines'
+        // units: 1 = 900p, 0.8 = 720p; default 1)
+        extern int vk_ab(const char *what);
+        static double alt = -1;
+        if (alt < 0) alt = getenv("LARECOMP_AB_SCALE") ? atof(getenv("LARECOMP_AB_SCALE")) : 1.0;
+        if (alt > 0 && vk_ab("scale") == 1) hs = alt;
+    }
     hs = fmax(hs, 0.1);
     o->scene_sx = hs * shape; o->scene_sy = hs;
     double scap = fmin(MAX_TEX / (1920.0 * o->scene_sx), MAX_TEX / (1080.0 * o->scene_sy));

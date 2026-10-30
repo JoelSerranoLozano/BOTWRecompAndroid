@@ -51,6 +51,10 @@ struct KThread {
     bool core0_held;       // kernel.c: this thread has core 0 (it runs; the others of core 0 wait)
     bool core0_evicted;    // atomic request to reconcile core ownership at the next guest safe point
     KThread *core0_next;   // core-0 runnable queue (c0_m)
+    pthread_cond_t core0_cv;  // kernel.c: waits for core 0 here (only the queue's head is woken at a handoff)
+    int tid;               // the host thread's id once it runs (kernel_core0_tids: the ADPF session's threads)
+    int8_t core0_aff;      // kernel.c core0_acquire: its host cores so far (0 untouched, 1 the fastest, 2 the others)
+    uint64_t core0_aff_retry;  // (when to try the fastest cores again: they were paused)
 #endif
 };
 

@@ -673,6 +673,52 @@ void plat_thread_unpin(void) {
     uclamp_min_thread();
 }
 
+// Core 0 on the fastest cores (LARECOMP_C0_FAST=0: off). The game's threads of core 0 take turns (kernel.c), so
+// together they are one thread's worth of work - spread over the big cores by the scheduler, each looked partly busy
+// and the governor left those cores at ~0.9 GHz while the prime core idled (Galaxy S23, open world: ~5 fps). On the
+// fastest cores only they keep them busy and clocked up (S23, with root's taskset: 4.9 -> 6.9 fps). The threads of
+// the other cores (1-3) go to the rest, so they don't take core 0's place. Unlike LARECOMP_PIN (the main thread alone,
+// faster than its job workers: a race in the game's job system), all of core 0's threads move together. Not on a
+// phone whose cores all have the same top clock.
+static cpu_set_t c0_fast, c0_rest;
+static int c0_fast_on = -1;
+static void c0_fast_init(void) {
+    const char *e = getenv("LARECOMP_C0_FAST");
+    long mhz[64] = {0}, best = 0;
+    int n = 0;
+    for (int c = 0; c < 64; c++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE *f = fopen(path, "re");
+        if (!f) continue;
+        if (fscanf(f, "%ld", &mhz[c]) != 1) mhz[c] = 0;
+        fclose(f);
+        if (mhz[c] > best) best = mhz[c];
+        n = c + 1;
+    }
+    CPU_ZERO(&c0_fast);
+    CPU_ZERO(&c0_rest);
+    for (int c = 0; c < n; c++)
+        if (mhz[c]) CPU_SET(c, mhz[c] == best ? &c0_fast : &c0_rest);
+    int nf = CPU_COUNT(&c0_fast), nr = CPU_COUNT(&c0_rest);
+    c0_fast_on = !(e && !strcmp(e, "0")) && nf > 0 && nr > 0;
+    LOG("[android] core 0 on the fastest cores (%d at %ld MHz, %d others): %s\n", nf, best / 1000, nr,
+        c0_fast_on ? "on" : e && !strcmp(e, "0") ? "off (LARECOMP_C0_FAST=0)" : "off (one kind of core)");
+}
+bool plat_core0_affinity(bool on_core0) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, c0_fast_init);
+    if (!c0_fast_on) return true;
+    if (sched_setaffinity(0, sizeof(cpu_set_t), on_core0 ? &c0_fast : &c0_rest)) {
+        // (EINVAL: none of those cores is active - Qualcomm's core_ctl pauses the prime core while no core of the
+        // cluster before it is busy enough; the caller tries again later)
+        static atomic_int told;
+        if (atomic_fetch_add(&told, 1) < 3) LOG("[android] core 0 affinity: %s (cores paused? trying later)\n", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 static void pin_to_fastest_cores(void) {
     if (!getenv("LARECOMP_PIN")) return;
     long best = 0, mhz[CPU_SETSIZE] = {0};
@@ -833,6 +879,51 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
             }
         }
         if (slot != 0 || !session[0]) return;  // Render thread doesn't report separately in single-session mode
+
+        // The game's other threads of core 0 too (its job workers: they take turns with the main thread there, so a
+        // frame's work is spread over several threads, each busy only part of the time, and the governor kept them
+        // on a low clock - Galaxy S23, open world: big cores at ~0.9 GHz, prime idle, ~5 fps; a utilization floor
+        // for the app's threads gave 8 fps). Refreshed every 2 s as threads start and end. API 34+ (setThreads);
+        // LARECOMP_ADPF_GAME_THREADS=0: only the two threads above, as before; =all: every guest thread, any core.
+        static int game_threads = -1;
+        static uint64_t threads_at;
+        static int32_t last[64];
+        static int nlast;
+        if (game_threads < 0) {
+            const char *e = getenv("LARECOMP_ADPF_GAME_THREADS");
+            game_threads = !set_threads || (e && !strcmp(e, "0")) ? 0 : e && !strcmp(e, "all") ? 2 : 1;
+        }
+        uint64_t now_ns = plat_now_ns();
+        if (game_threads > 0 && now_ns - threads_at > 2000000000ull) {
+            threads_at = now_ns;
+            extern int kernel_core0_tids(int32_t *out, int max, bool all);
+            int32_t tids[64];
+            int n = 0;
+            if (s_presenting_tid > 0) tids[n++] = s_presenting_tid;
+            if (s_render_tid > 0) tids[n++] = s_render_tid;
+            int32_t c0[62];
+            int nc = kernel_core0_tids(c0, 62, game_threads == 2);
+            for (int i = 0; i < nc; i++) {
+                bool dup = false;
+                for (int j = 0; j < n; j++) dup |= tids[j] == c0[i];
+                if (!dup) tids[n++] = c0[i];
+            }
+            if (n != nlast || memcmp(tids, last, sizeof *tids * (size_t)n)) {
+                int r = set_threads(session[0], tids, (size_t)n);
+                static int logs;
+                if (r == 0) {
+                    memcpy(last, tids, sizeof *tids * (size_t)n), nlast = n;
+                    s_session_threads = n;
+                    if (logs++ < 5)
+                        LOG("[android] performance hint session: %d threads (the game's%s included)\n", n,
+                            game_threads == 2 ? "" : " of core 0");
+                } else {
+                    s_errors++, s_last_error = r;
+                    LOG("[android] performance hint session: adding the game's threads failed (%d), left as it was\n", r);
+                    game_threads = 0;
+                }
+            }
+        }
 
         if (target_ns != target[0]) {
             int r = retarget(session[0], (int64_t)target_ns);

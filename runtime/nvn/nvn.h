@@ -66,6 +66,8 @@ typedef struct NvnDescPool {
     uint64_t addr;
     int count;
     void *entries;  // NvnTexEntry[] or NvnSamplerDesc[]
+    void *gentries; // (Android, ordered slots) the same as the game's thread last set them: entries is the render
+                    // thread's, changed in the order of the requests (objects.c register_texture)
     struct NvnDescPool *next;  // all descriptor allocations of this boot
 } NvnDescPool;
 

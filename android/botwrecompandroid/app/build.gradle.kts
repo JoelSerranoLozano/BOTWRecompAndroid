@@ -19,6 +19,12 @@ android {
 
     defaultConfig {
         applicationId = "com.botwrecomp.android"
+        // -PbotwAppIdSuffix=.test: a test build installed beside the release (its own package, data folder and label)
+        (findProperty("botwAppIdSuffix") as String?)?.takeIf { it.isNotEmpty() }?.let {
+            applicationIdSuffix = it
+            manifestPlaceholders["appLabel"] = "BOTWRecompAndroid$it"
+        }
+        if (!manifestPlaceholders.containsKey("appLabel")) manifestPlaceholders["appLabel"] = "BOTWRecompAndroid"
         minSdk = 30
         targetSdk = 36
         versionCode = 22

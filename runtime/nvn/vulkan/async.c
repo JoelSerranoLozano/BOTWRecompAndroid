@@ -23,7 +23,7 @@
 #include "../../platform.h"
 #include "../../rt.h"
 
-enum { REQ_EXEC, REQ_PRESENT, REQ_FENCE };
+enum { REQ_EXEC, REQ_PRESENT, REQ_FENCE, REQ_CALL };
 typedef struct { int type; uint64_t a; void *p; uint64_t id; } Req;
 
 #define QN 4096  // requests in flight (a frame has a few dozen)
@@ -92,7 +92,8 @@ static void *render_main(void *arg) {
         vk_tl(r.type == REQ_EXEC ? "render: list start" : r.type == REQ_PRESENT ? "render: present start" : "render: fence", r.id, 0);
         if (r.type == REQ_EXEC) { vk_execute_now(r.a); free(r.p); }  // (r.p: the list copy, vk_async_execute)
         else if (r.type == REQ_PRESENT) vk_present_now((NvnTexture *)r.p);
-        if (r.type != REQ_FENCE) vk_tl(r.type == REQ_EXEC ? "render: list end" : "render: present end", r.id, 0);
+        else if (r.type == REQ_CALL) ((void (*)(void *))(uintptr_t)r.a)(r.p);
+        if (r.type == REQ_EXEC || r.type == REQ_PRESENT) vk_tl(r.type == REQ_EXEC ? "render: list end" : "render: present end", r.id, 0);
         else if (r.type == REQ_FENCE) nvn_sync_set_seq(r.a, renderer_fence_seq());
         uint64_t elapsed = plat_now_ns() - t0;
         frame_cpu += cpu_timing ? render_cpu_ns() - cpu0 : elapsed;
@@ -140,6 +141,15 @@ static uint64_t push(int type, uint64_t a, void *p) {
     return id;
 }
 
+// fn(arg) on the render thread, in order with the command lists queued so far and those after: a descriptor slot
+// rewritten for the lists that follow, while those before still see the old one (objects.c). False: no render thread
+// (or this is it) - the caller does it itself, now.
+bool vk_async_call(void (*fn)(void *), void *arg) {
+    if (!vk_async_on() || vk_async_is_render_thread()) return false;
+    push(REQ_CALL, (uint64_t)(uintptr_t)fn, arg);
+    return true;
+}
+
 // Until the render thread has finished request `id` (0: nothing to wait for).
 void vk_async_wait_id(uint64_t id) {
     if (!id || !started || vk_async_is_render_thread()) return;
@@ -155,6 +165,26 @@ void vk_async_drain(void) {
     uint64_t id = q_tail;
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
     pthread_mutex_unlock(&q_lock);
+}
+
+// vk_async_drain for a caller that holds no host lock: core 0 goes to the game's other threads meanwhile, as in a
+// fence wait (with a lock held, another thread of core 0 could wait for it while this one waits for core 0). Returns
+// the time waited. LARECOMP_DRAIN_C0=0: as vk_async_drain.
+uint64_t vk_async_drain_unlocked(void) {
+    if (!started || vk_async_is_render_thread()) return 0;
+    static int c0 = -1;
+    if (c0 < 0) { const char *e = getenv("LARECOMP_DRAIN_C0"); c0 = !(e && !strcmp(e, "0")); }
+    pthread_mutex_lock(&q_lock);
+    uint64_t id = q_tail;
+    if (q_done >= id) { pthread_mutex_unlock(&q_lock); return 0; }
+    pthread_mutex_unlock(&q_lock);
+    uint64_t t0 = plat_now_ns();
+    if (c0) kernel_blocking_begin();
+    pthread_mutex_lock(&q_lock);
+    while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
+    pthread_mutex_unlock(&q_lock);
+    if (c0) kernel_blocking_end();
+    return plat_now_ns() - t0;
 }
 
 // The fences a command list signals (CMD_FENCE_SYNC, in it or in the lists it calls) get the list's request: a wait

@@ -108,6 +108,9 @@ void plat_adpf_stats(PlatAdpfStats *out);
 // A new thread back on every core: threads inherit the creating thread's affinity, and the presenting thread is
 // pinned to the fastest cores (platform/android.c)
 void plat_thread_unpin(void);
+// The calling thread on the fastest cores (on_core0: it runs the game's core 0) or on the others (android.c)
+// (false: not now - those cores are paused (core_ctl); try again later)
+bool plat_core0_affinity(bool on_core0);
 #endif
 #endif
 

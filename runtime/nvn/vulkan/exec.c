@@ -5,7 +5,9 @@
 #include <math.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <errno.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -88,7 +90,66 @@ static bool in_pass;
 static uint32_t pass_written;  // (the attachments this pass's draws wrote so far: draw_writes)
 static uint32_t pass_dup_null;  // (color slots left unbound: their image is bound in another slot - begin_pass)
 
+#ifdef __ANDROID__
+// The completion watcher (LARECOMP_VK_FENCE_WATCH=0: off). On Turnip over KGSL the timeline semaphore is emulated
+// (Mesa's vk_sync_timeline): reading its value polls the oldest pending submission with a zero-timeout KGSL timestamp
+// wait, which sleeps until that submission is done or a scheduler tick (~4 ms) passes - holding the timeline's lock.
+// It was read after every submission (vk_collect_dead): Galaxy S23 (Adreno 740), open world, the render thread slept
+// there ~70% of its time while the GPU sat idle waiting for the next batch. Here each submission also carries a fence
+// (one per submission slot), a thread of its own waits for them in order, and the submission done so far is a
+// variable: reading it costs nothing, and a wait (vk_wait_seq) waits for that thread.
+static int fw_on = -1;
+static VkFence fw_fence[SUBS];
+static uint64_t fw_seq[SUBS], fw_submitted;  // (fw_m)
+static _Atomic uint64_t fw_done;
+static pthread_mutex_t fw_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fw_more = PTHREAD_COND_INITIALIZER, fw_less = PTHREAD_COND_INITIALIZER;
+void vk_tl(const char *what, uint64_t a, uint64_t b);  // (LARECOMP_FRAME_TIMELINE, below)
+static bool fw_enabled(void) {
+    if (fw_on < 0) {
+        const char *e = getenv("LARECOMP_VK_FENCE_WATCH");
+        fw_on = !(e && !strcmp(e, "0"));
+        LOG("[vk] completion watcher (fences): %s\n", fw_on ? "on" : "off (LARECOMP_VK_FENCE_WATCH=0)");
+    }
+    return fw_on;
+}
+static void *fw_main(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&fw_m);
+    for (;;) {
+        while (atomic_load(&fw_done) >= fw_submitted) pthread_cond_wait(&fw_more, &fw_m);
+        uint64_t next = atomic_load(&fw_done) + 1;
+        int slot = -1;
+        for (int i = 0; i < SUBS; i++) if (fw_seq[i] == next) { slot = i; break; }
+        if (slot < 0) {  // (can't happen: every submission has a slot) - don't stall the waiters
+            LOG("[vk] completion watcher: no fence for submission %llu\n", (unsigned long long)next);
+            atomic_store(&fw_done, next);
+            pthread_cond_broadcast(&fw_less);
+            continue;
+        }
+        VkFence f = fw_fence[slot];
+        pthread_mutex_unlock(&fw_m);
+        VkResult r = vkWaitForFences(g_vk.dev, 1, &f, VK_TRUE, 10ull * 1000000000ull);
+        pthread_mutex_lock(&fw_m);
+        if (r == VK_TIMEOUT) {
+            LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)next);
+            continue;
+        }
+        if (r != VK_SUCCESS) LOG("[vk] completion watcher: vkWaitForFences %d (submission %llu)\n", r, (unsigned long long)next);
+        atomic_store(&fw_done, next);
+        pthread_cond_broadcast(&fw_less);
+        pthread_mutex_unlock(&fw_m);
+        vk_tl("gpu: done (watcher)", next, 0);  // (LARECOMP_FRAME_TIMELINE: when each submission was seen done)
+        pthread_mutex_lock(&fw_m);
+    }
+    return NULL;
+}
+#endif
+
 uint64_t vk_completed_seq(void) {
+#ifdef __ANDROID__
+    if (fw_enabled()) return atomic_load(&fw_done);
+#endif
     uint64_t v = 0;
     vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
     return v;
@@ -96,6 +157,9 @@ uint64_t vk_completed_seq(void) {
 
 // (LARECOMP_VK_PROF) waits on the GPU by cause: the caller names it in wait_why just before waiting
 static __thread const char *wait_why;
+// A wait after which the CPU reads guest memory the GPU wrote: the game's (nvnSyncWait, nvnQueueFinish) or a step
+// done by the CPU in the GPU's order (renderer_flush). Only these need the arena's copy-backs (gc_at_data_waits).
+static __thread bool wait_data;
 static struct { const char *why; uint64_t ns, n; } wait_tab[12];
 static pthread_mutex_t wait_tab_lock = PTHREAD_MUTEX_INITIALIZER;
 static void wait_account(uint64_t ns) {
@@ -117,7 +181,8 @@ static bool gwin_mode;    // (heap placed, larger than a storage buffer reaches:
 #endif
 static VkSpan gc_span;    // this draw's / dispatch's copy, gc_size bytes (0: none)
 static uint64_t gc_size;
-static void gcopy_retire(uint64_t done);
+static void gcopy_retire(uint64_t done, bool arena);
+static bool gc_at_data_waits(void);
 #endif
 
 void vk_wait_seq(uint64_t seq) {
@@ -125,7 +190,23 @@ void vk_wait_seq(uint64_t seq) {
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
-    VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    VkResult r;
+#ifdef __ANDROID__
+    if (fw_enabled()) {  // (the completion watcher's number: no call into the driver)
+        (void)wi;
+        r = VK_SUCCESS;
+        if (atomic_load(&fw_done) < seq) {
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_sec += 10;
+            pthread_mutex_lock(&fw_m);
+            while (atomic_load(&fw_done) < seq && r == VK_SUCCESS)
+                if (pthread_cond_timedwait(&fw_less, &fw_m, &until) == ETIMEDOUT) r = VK_TIMEOUT;
+            pthread_mutex_unlock(&fw_m);
+        }
+    } else
+#endif
+    r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
     stat_wait_ns += SDL_GetTicksNS() - t0;
     cum_wait += SDL_GetTicksNS() - t0;
     wait_account(SDL_GetTicksNS() - t0);
@@ -135,7 +216,7 @@ void vk_wait_seq(uint64_t seq) {
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
     else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
 #ifdef __ANDROID__
-    if (r == VK_SUCCESS) gcopy_retire(seq);
+    if (r == VK_SUCCESS) gcopy_retire(seq, wait_data || !gc_at_data_waits());
 #endif
     else {
         extern void vk_devlost_dump(void);
@@ -224,6 +305,13 @@ static void tl_add(int64_t t, const char *what, uint64_t a, uint64_t b) {
     pthread_mutex_unlock(&tl_lock);
 }
 void vk_tl(const char *what, uint64_t a, uint64_t b) { tl_add((int64_t)plat_now_ns(), what, a, b); }
+void vk_tl_arm(void) {  // (device.c: the "prof_timeline" file) four frames from the next one
+    if (tl_from == -2) tl_from = getenv("LARECOMP_FRAME_TIMELINE") ? atol(getenv("LARECOMP_FRAME_TIMELINE")) : -1;
+    pthread_mutex_lock(&tl_lock);
+    tl_n = 0;
+    tl_from = (long)renderer_present_count() + 1;
+    pthread_mutex_unlock(&tl_lock);
+}
 #endif
 static int counter_mode = -1;  // 0 cpu, 1 frozen, 2 gpu
 static uint64_t stat_counters_gpu;
@@ -267,7 +355,8 @@ double vk_frame_gpu_ms(void) {
 void vk_pace_frame(void) {
     {   // (write-backs of passes the GPU has finished since: the game may read them this frame)
         uint64_t v = 0;
-        if (vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v) == VK_SUCCESS) wb_apply(v);
+        v = vk_completed_seq();
+        wb_apply(v);
     }
     if (pace_on < 0) { const char *e = getenv("LARECOMP_PACE"); pace_on = !e || atoi(e) != 0; }
     static uint64_t last, last_wait;
@@ -298,6 +387,24 @@ void vk_pace_frame(void) {
     uint64_t p = now - last, wt = w - last_wait;
     bool first = !last;
     last = now, last_wait = w;
+#ifdef __ANDROID__
+    // ADPF and core 0 (LARECOMP_ADPF_CORE0=0: off): the game's work in a frame is what all its threads of core 0 did
+    // (they take turns there), and a frame over 100 ms is reported too. Both were left out: at 5-10 fps (Galaxy S23 and
+    // the Snapdragon 8 Gen 3 of issue #41) no frame was ever reported - each looked like a hitch - and the governor kept
+    // the game's cores at ~0.9 GHz. Frames over 1 s (loading) still aren't.
+    static int adpf_c0 = -1;
+    if (adpf_c0 < 0) { const char *e = getenv("LARECOMP_ADPF_CORE0"); adpf_c0 = !(e && !strcmp(e, "0")); }
+    static uint64_t last_c0;
+    extern uint64_t kernel_core0_busy_ns(void);
+    uint64_t c0 = adpf_c0 ? kernel_core0_busy_ns() : 0, c0_frame = c0 - last_c0;
+    last_c0 = c0;
+    if (!first && adpf_c0 && p > 100000000ull && p <= 1000000000ull) {
+        uint64_t game = p > wt ? p - wt : 0;
+        if (c0_frame > game) game = c0_frame;
+        if (game > p) game = p;
+        plat_frame_work_gpu(game, 0, 16666667ull, game);  // (the pace's own bookkeeping skips it, as before)
+    }
+#endif
     if (first || p > 100000000ull) return;  // (loading, a hitch: not a pace)
     double busy = (p > wt ? p - wt : 0) / 1e6;
 #ifdef __ANDROID__
@@ -306,6 +413,8 @@ void vk_pace_frame(void) {
     extern uint64_t vk_async_frame_work_ns(void);
     double render_busy = vk_async_on() ? vk_async_frame_work_ns() / 1e6 : 0;
     double game_busy = busy;
+    double adpf_game = game_busy;  // (ADPF's: all of core 0's work in the frame, above)
+    if (adpf_c0 && c0_frame / 1e6 > adpf_game) adpf_game = (c0_frame < p ? c0_frame : p) / 1e6;
     if (render_busy > busy) busy = render_busy;
 #endif
 #ifdef __ANDROID__
@@ -325,11 +434,11 @@ void vk_pace_frame(void) {
         // time is what a 60 fps frame would take, and halved it looked comfortable: the clock stayed low)
         // The render hint defaults to the established wall-time signal; CPU-only timing is opt-in.
         extern uint64_t vk_async_frame_cpu_ns(void);
-        double hint_busy = game_busy;
+        double hint_busy = adpf_game;
         double render_cpu = vk_async_on() ? vk_async_frame_cpu_ns() / 1e6 : 0;
         if (render_cpu > hint_busy) hint_busy = render_cpu;
         plat_frame_work_gpu((uint64_t)(hint_busy * 1e6), no_gpu ? 0 : gpu, follow && pace_slow ? 33333333ull : 16666667ull,
-                            (uint64_t)(game_busy * 1e6));
+                            (uint64_t)(adpf_game * 1e6));
     }
 #endif
 #ifdef __ANDROID__
@@ -820,13 +929,45 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)n, .pCommandBufferInfos = cbs,
                         .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig,
                         .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
+#ifdef __ANDROID__
+    // (with the completion watcher nothing waits on the timeline: not signalling it at all - on Turnip over KGSL each
+    // signal runs the emulated timeline's cleanup, which polls the pending submissions and sleeps like a read of its
+    // value: ~53% of the render thread's time once the reads were gone)
+    if (fw_enabled()) si.signalSemaphoreInfoCount = signal ? 1 : 0, si.pSignalSemaphoreInfos = &sig[1];
+#endif
     {
         PROF_T0();
         dl_note("submit %llu", (unsigned long long)submit_seq + 1);
 #ifdef __ANDROID__
         uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
 #endif
-        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        VkFence fence = VK_NULL_HANDLE;
+#ifdef __ANDROID__
+        if (fw_enabled()) {  // (this slot's fence: its last submission is done - sub() waited for it)
+            if (!fw_fence[cur_sub]) {
+                VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                VK_CHECK(vkCreateFence(g_vk.dev, &fi, NULL, &fw_fence[cur_sub]));
+            } else VK_CHECK(vkResetFences(g_vk.dev, 1, &fw_fence[cur_sub]));
+            fence = fw_fence[cur_sub];
+        }
+#endif
+        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, fence);
+#ifdef __ANDROID__
+        if (fence && sr == VK_SUCCESS) {
+            static bool fw_started;
+            pthread_mutex_lock(&fw_m);
+            fw_seq[cur_sub] = submit_seq + 1;
+            fw_submitted = submit_seq + 1;
+            if (!fw_started) {
+                fw_started = true;
+                pthread_t th;
+                pthread_create(&th, NULL, fw_main, NULL);
+                pthread_detach(th);
+            }
+            pthread_cond_signal(&fw_more);
+            pthread_mutex_unlock(&fw_m);
+        }
+#endif
 #ifdef __ANDROID__
         tl_add((int64_t)plat_now_ns(), wait || signal ? "render: submitted (present)" : "render: submitted", submit_seq + 1, 0);
         if (trace_start) vk_timing_trace_wait(VK_TIMING_SUBMIT, SDL_GetTicksNS() - trace_start);
@@ -859,7 +1000,9 @@ void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_
 void renderer_flush(void) {
     renderer_submit();
     if (!wait_why) wait_why = "flush";
+    wait_data = true;
     vk_wait_seq(submit_seq);
+    wait_data = false;
 }
 
 void renderer_sync(void) {
@@ -867,7 +1010,9 @@ void renderer_sync(void) {
     uint64_t s = submit_seq;
     pthread_mutex_unlock(&seq_lock);
     wait_why = "QueueFinish / sync all";
+    wait_data = true;
     vk_wait_seq(s);
+    wait_data = false;
 }
 
 uint64_t renderer_fence_seq(void) {
@@ -899,7 +1044,9 @@ void renderer_wait_seq(uint64_t seq) {
     static int log = -1;  // LARECOMP_LOG_SYNCSEQ=1: which submission each SyncWait waits for (vs the last one) and how long
     if (log < 0) log = getenv("LARECOMP_LOG_SYNCSEQ") != NULL;
     uint64_t t0 = log ? SDL_GetTicksNS() : 0;
+    wait_data = true;
     vk_wait_seq(seq > s ? s : seq);  // not submitted yet (other thread): everything submitted so far
+    wait_data = false;
     if (log) LOG("[syncseq] t %.2f wait seq %llu (submitted %llu): %.2f ms, frame %llu\n", t0 / 1e6, (unsigned long long)seq,
                  (unsigned long long)s, (SDL_GetTicksNS() - t0) / 1e6, (unsigned long long)vk_frame_counter());
 }
@@ -975,7 +1122,7 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
     }
     uint64_t done = vk_completed_seq();
 #ifdef __ANDROID__
-    gcopy_retire(done);  // (copies back out of chunks about to be reused)
+    gcopy_retire(done, !gc_at_data_waits());  // (copies back out of chunks about to be reused)
 #endif
     int pick = -1;
     for (int i = 0; i < nchunks; i++)
@@ -1813,6 +1960,22 @@ static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v :
 static volatile uint64_t g_scene_frame;
 uint64_t vk_scene_frame(void) { return g_scene_frame; }
 
+#ifdef __ANDROID__
+// The GPU has done everything submitted (the completion watcher's number) and what is recorded since has waited at
+// least LARECOMP_VK_DRY_US (1000): submit it now, at this pass boundary or inside a long pass (split_long_pass),
+// rather than after LARECOMP_VK_CHUNK_US of translation. At a frame's start the first submission held a few small
+// passes, then the GPU sat idle ~2.7 ms for the next (S23, sync lag off, 2026-10-29: ~4.4 ms idle a frame).
+// LARECOMP_VK_DRY_US=0: off (LARECOMP_AB=<n>:dry measures it: on in the odd stretches).
+static bool gpu_dry(void) {
+    static long us = -1;
+    if (us < 0) { const char *e = getenv("LARECOMP_VK_DRY_US"); us = e ? atol(e) : 1000; }
+    int ab = AB("dry");
+    if (ab == 0 || (ab < 0 && us <= 0) || !fw_enabled()) return false;
+    long wait_us = us > 0 ? us : 1000;
+    return atomic_load(&fw_done) >= submit_seq && SDL_GetTicksNS() - last_submit_ns > (uint64_t)wait_us * 1000;
+}
+#endif
+
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     pipeline_dirty = true;
@@ -1844,7 +2007,8 @@ static void begin_pass(void) {
         }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
-        if (ch > 0 && vk_async_on() && last_submit_ns && SDL_GetTicksNS() - last_submit_ns > (uint64_t)ch * 1000)
+        if (vk_async_on() && last_submit_ns &&
+            ((ch > 0 && SDL_GetTicksNS() - last_submit_ns > (uint64_t)ch * 1000) || gpu_dry()))
             renderer_submit();
     }
 #endif
@@ -3278,8 +3442,8 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                 // the start screen's Driver compatibility; LARECOMP_FEEDBACK_INPLACE=1 on any driver).
                 if (g_inplace_copy < 0) {
                     extern bool vk_driver_is_turnip(void);
-                    extern bool vk_turnip_path_on(int setting);
-                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || (vk_driver_is_turnip() && vk_turnip_path_on(g_settings.inplace_reads));
+                    extern bool vk_turnip_inplace_on(int setting);
+                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || (vk_driver_is_turnip() && vk_turnip_inplace_on(g_settings.inplace_reads));
                     g_inplace_copy = getenv("LARECOMP_FEEDBACK_COPY") != NULL || !inplace;
                     LOG("[vk] targets a draw writes, sampled by it: %s (%s)\n", g_inplace_copy ? "copies" : "in place",
                         g_settings.inplace_reads < 0 ? "automatic" : "settings");
@@ -3960,16 +4124,102 @@ static void gfast_finish(VkCommandBuffer cb) {
 // What a storing shader wrote goes back to guest memory once its submission is done (gcopy_retire: from vk_transient
 // before the ring reuses a chunk, and after every wait). Without this, global loads read zero: the game's text is
 // drawn by a vertex shader that reads its vertices that way (nothing of it showed).
-typedef struct { const uint8_t *src; uint64_t addr, len, seq; uint8_t *shadow; const uint64_t *bseq; } GcBack;  // (arena)
-static GcBack gc_back[256];
-static int gc_nback;
+typedef struct { const uint8_t *src; uint64_t addr, len, seq; uint8_t *shadow; const uint64_t *bseq; uint8_t dup; } GcBack;  // (arena; dup: gcopy_mark_dups)
+static GcBack *gc_back;
+static int gc_nback, gc_cap;
+static uint64_t stat_gc_dropped;
 static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void gcopy_retire(uint64_t done) {
+// Room for one more copy-back (gc_lock held), or false: dropped. A fixed 256 filled once the GPU was the bottleneck
+// (Adreno 740 with the completion watcher: more submissions in flight between the game's waits; 1024 in use in play,
+// S23, 1.0.0, 2026-10-29) and the rest were dropped without a word - what those shaders stored never reached guest
+// memory. Now it grows. LARECOMP_GC_BACK_MAX=<n>: the cap (256: as before).
+static bool gc_back_room(void) {
+    static int max = -1;
+    if (max < 0) {
+        const char *e = getenv("LARECOMP_GC_BACK_MAX");
+        max = e && atoi(e) > 0 ? atoi(e) : 8192;
+    }
+    if (gc_nback < gc_cap) return true;
+    if (gc_cap < max) {
+        int cap = gc_cap ? gc_cap * 2 : 256;
+        if (cap > max) cap = max;
+        GcBack *nb = realloc(gc_back, (size_t)cap * sizeof *nb);
+        if (nb) {
+            gc_back = nb, gc_cap = cap;
+            if (cap > 256) LOG("[vk] copy-backs pending: room for %d now\n", cap);
+            return true;
+        }
+    }
+    stat_gc_dropped++;
+    if (stat_gc_dropped <= 20 || !(stat_gc_dropped & 1023))
+        LOG("[vk] copy-backs pending full (%d): %llu dropped so far\n", gc_nback, (unsigned long long)stat_gc_dropped);
+    return false;
+}
+
+// Ready copy-backs of one arena range share their source - the range's slot, which holds the GPU's latest writes -
+// so of those, only the newest is compared: the older ones would find what it finds (their skipped blocks, newer
+// uploads of the CPU, are a subset of its), and then nothing, after it copied. The same compute shaders store to the
+// same ranges several times a frame: at the frame's wait all of them were ready together, each compared in full
+// (~8 ms of the S23's frame inside nvnSyncWait, 2026-10-29). LARECOMP_GC_DEDUP=0: off (LARECOMP_AB=<n>:gcdedup).
+static uint64_t stat_gc_ret, stat_gc_dup, stat_gc_cmp_bytes, stat_gc_ns, stat_gc_calls, stat_gc_last_log;
+static void gcopy_mark_dups(uint64_t done) {  // (gc_lock held) dup = 1 on every ready arena entry a newer one covers
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_GC_DEDUP"); on = !e || atoi(e) != 0; }
+    if (!on || AB("gcdedup") == 1) return;
+    int ready = 0;
+    for (int i = 0; i < gc_nback; i++) ready += gc_back[i].seq <= done && gc_back[i].shadow;
+    if (ready < 2) return;
+    static int32_t *tab;
+    static int cap;
+    int want = 64;
+    while (want < 2 * ready) want <<= 1;
+    if (want > cap) {
+        int32_t *t = realloc(tab, (size_t)want * sizeof *t);
+        if (!t) return;
+        tab = t, cap = want;
+    }
+    memset(tab, 0xff, (size_t)want * sizeof *tab);
+    for (int i = gc_nback - 1; i >= 0; i--) {  // (newest first: entries are appended in submission order)
+        GcBack *e = &gc_back[i];
+        if (e->seq > done || !e->shadow) continue;
+        uint64_t h = ((uint64_t)(uintptr_t)e->src * 0x9E3779B97F4A7C15ull) ^ (e->addr * 0xC2B2AE3D27D4EB4Full) ^ e->len;
+        h ^= h >> 29;
+        for (int s = (int)(h & (uint64_t)(want - 1));; s = (s + 1) & (want - 1)) {
+            if (tab[s] < 0) { tab[s] = i; break; }
+            GcBack *o = &gc_back[tab[s]];
+            if (o->src == e->src && o->addr == e->addr && o->len == e->len) { e->dup = 1; break; }
+        }
+    }
+}
+
+// The arena's copy-backs only at the waits after which the CPU reads guest memory (wait_data), not at the render
+// thread's own (a ring slot's reuse, a transient chunk's): there the ready ones of a range were compared in full a
+// dozen times a frame, at the game's wait they are compared once (gcopy_mark_dups). The plain copies' still go back
+// before their chunk is reused (S23, sync lag off: 1.6 GB compared every 30 s instead of ~17, +1.5%). Automatic: with
+// the sync lag off - the game waits for each frame's GPU work, so what the render thread copies out of guest memory for
+// the next frame comes after that wait; with the lag on it may not have landed yet. LARECOMP_GC_AT_DATA_WAITS=1 / 0
+// over that (LARECOMP_AB=<n>:gcwait: measured).
+static bool gc_at_data_waits(void) {
+    static int env = -2, lag_env = -2;
+    if (env == -2) { const char *e = getenv("LARECOMP_GC_AT_DATA_WAITS"); env = e ? atoi(e) != 0 : -1; }
+    int ab = AB("gcwait");
+    if (ab >= 0) return ab == 1;
+    if (env >= 0) return env;
+    if (lag_env == -2) lag_env = getenv("LARECOMP_SYNC_LAG") ? atoi(getenv("LARECOMP_SYNC_LAG")) : -1;
+    return (lag_env >= 0 ? lag_env : g_settings.sync_lag ? 1 : 0) == 0;  // (the setting read each time: the menu changes it)
+}
+
+static void gcopy_retire(uint64_t done, bool arena) {
     pthread_mutex_lock(&gc_lock);
+    uint64_t t0 = SDL_GetTicksNS();
+    if (arena) gcopy_mark_dups(done);
     int k = 0;
     for (int i = 0; i < gc_nback; i++) {
-        if (gc_back[i].seq <= done) {
+        if (gc_back[i].seq <= done && (arena || !gc_back[i].shadow)) {
+            stat_gc_ret++;
+            if (gc_back[i].dup) { stat_gc_dup++; continue; }
+            if (gc_back[i].shadow) stat_gc_cmp_bytes += gc_back[i].len;
             if (!gc_back[i].shadow) {
                 memcpy((void *)(uintptr_t)gc_back[i].addr, gc_back[i].src, gc_back[i].len);
                 continue;
@@ -3992,6 +4242,17 @@ static void gcopy_retire(uint64_t done) {
         } else gc_back[k++] = gc_back[i];
     }
     gc_nback = k;
+    uint64_t t1 = SDL_GetTicksNS();
+    stat_gc_ns += t1 - t0;
+    stat_gc_calls++;
+    if (!stat_gc_last_log) stat_gc_last_log = t1;
+    if (t1 - stat_gc_last_log >= 30000000000ull) {  // (the copy-backs' cost, every 30 s)
+        LOG("[vk] copy-backs, last 30 s: %llu retired (%llu duplicates skipped), %.1f MB compared, %.0f ms in %llu calls\n",
+            (unsigned long long)stat_gc_ret, (unsigned long long)stat_gc_dup, stat_gc_cmp_bytes / 1048576.0, stat_gc_ns / 1e6,
+            (unsigned long long)stat_gc_calls);
+        stat_gc_ret = stat_gc_dup = stat_gc_cmp_bytes = stat_gc_ns = stat_gc_calls = 0;
+        stat_gc_last_log = t1;
+    }
     pthread_mutex_unlock(&gc_lock);
 }
 
@@ -4261,7 +4522,7 @@ static bool gres_prepare(const GcRange *r, int m, bool store) {
             // also reads what its compute shaders wrote as uniform buffers, vertices and textures, which come from
             // guest memory (gcopy_retire, at the game's waits)
             pthread_mutex_lock(&gc_lock);
-            if (gc_nback < 256)
+            if (gc_back_room())
                 gc_back[gc_nback++] = (GcBack){ga_ptr + e->off + (lo - e->lo), HEAP_BASE + lo, hi - lo, vk_pending_seq(),
                                                e->shadow + (lo - e->lo), e->bseq + (lo - e->lo) / 256};
             pthread_mutex_unlock(&gc_lock);
@@ -4430,7 +4691,7 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
         gmap_tab[i * 4 + 0] = (uint32_t)r[i].lo;
         gmap_tab[i * 4 + 1] = (uint32_t)len;
         gmap_tab[i * 4 + 2] = (uint32_t)(off >> 2);
-        if (store && gc_nback < 256)
+        if (store && gc_back_room())
             gc_back[gc_nback++] = (GcBack){(const uint8_t *)gc_span.ptr + off, HEAP_BASE + r[i].lo, len, seq, NULL, NULL};
         off += (len + 255) & ~255ull;
     }
@@ -4819,6 +5080,8 @@ static float g_mirror_w;  // mirror mode's composite: its render target width (r
 static bool is_ubo(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; }
 
 // dyn / ndyn: the set's dynamic uniform buffer offsets, in binding order (its bindings of that type: compile_program)
+// (LARECOMP_LOG_REBIND) the draw's dynamic uniform buffers' sizes, beside their offsets (draw_ points it at its array)
+static uint32_t *g_dyn_range, *g_dyn_bind;
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii,
                                  uint32_t *dyn, uint32_t *ndyn) {
@@ -4941,9 +5204,17 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         for (int i = 0; i < n; i++) {
             if (w[i].descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) continue;
             uint32_t k = nd++;
-            while (k > 0 && bind[k - 1] > w[i].dstBinding) { bind[k] = bind[k - 1]; if (dyn) dyn[k] = dyn[k - 1]; k--; }
+            while (k > 0 && bind[k - 1] > w[i].dstBinding) {
+                bind[k] = bind[k - 1];
+                if (dyn) dyn[k] = dyn[k - 1];
+                if (g_dyn_range) g_dyn_range[k] = g_dyn_range[k - 1];
+                if (g_dyn_bind) g_dyn_bind[k] = g_dyn_bind[k - 1];
+                k--;
+            }
             bind[k] = w[i].dstBinding;
             if (dyn) dyn[k] = (uint32_t)bi[i].offset;
+            if (g_dyn_range) g_dyn_range[k] = (uint32_t)bi[i].range;
+            if (g_dyn_bind) g_dyn_bind[k] = w[i].dstBinding;
             bi[i].offset = 0;
         }
         if (ndyn) *ndyn = nd;
@@ -5641,7 +5912,7 @@ static void draw_(CmdRec *r, bool indexed) {
         return;
     }
     ss_enabled();
-    if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; stat_pipe_binds++; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
+    if (ss_need(SS_PIPE, ss.pipe == pp->pipe && AB("repipe") != 1)) { ss.pipe = pp->pipe; stat_pipe_binds++; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
 
@@ -5699,7 +5970,10 @@ static void draw_(CmdRec *r, bool indexed) {
 #endif
     uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
     memset(cbw_patch, 0, sizeof cbw_patch);  // (cbwin_bind fills them while the sets are written)
+    uint32_t dyn_range[64], dyn_bind[64];
+    g_dyn_range = dyn_range, g_dyn_bind = dyn_bind;
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
+    g_dyn_range = NULL, g_dyn_bind = NULL;
     PROF_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = prof ? SDL_GetTicksNS() : 0;
@@ -5756,13 +6030,72 @@ static void draw_(CmdRec *r, bool indexed) {
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     uint64_t prof_t1_ = prof ? SDL_GetTicksNS() : 0;
+    g_dyn_range = dyn_range + ndv, g_dyn_bind = dyn_bind + ndv;
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn + ndv, &ndf);
+    g_dyn_range = NULL, g_dyn_bind = NULL;
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
     // (the same sets and offsets as the previous draw - the set cache, stage_set: not bound again)
     uint32_t nd = ndv + ndf;
+    {   // LARECOMP_LOG_REBIND=1 (diagnosis): why each draw binds its sets again - other sets (textures, buffers, a new
+        // layout) or only the dynamic uniform buffers' offsets, how many of them and how large (a single small one moving
+        // per draw could be push constants instead), every 30 s
+        static int on = -1;
+        if (on < 0) on = getenv("LARECOMP_LOG_REBIND") != NULL;
+        static uint64_t n_draw, n_rb, n_first, n_sets, n_dyn[4], n_size[4], last;
+        if (on) {
+            n_draw++;
+            bool same = (ss.known & SS_SETS) && ss.layout == pr->layout && ss.sets[0] == vset && ss.sets[1] == fset && ss.ndyn == nd;
+            int nchg = 0, which = -1;
+            uint32_t big = 0;
+            if (same)
+                for (uint32_t k = 0; k < nd; k++)
+                    if (ss.dyn[k] != dyn[k]) {
+                        nchg++;
+                        if (dyn_range[k] > big) big = dyn_range[k];
+                        which = (k < ndv ? 0 : 64) + (int)(dyn_bind[k] & 63);
+                    }
+            static uint64_t n_which[128];
+            if (same && nchg == 1 && which >= 0) n_which[which]++;
+            if (!(ss.known & SS_SETS)) n_rb++, n_first++;
+            else if (!same) n_rb++, n_sets++;
+            else if (nchg) {
+                n_rb++;
+                n_dyn[nchg > 3 ? 3 : nchg]++;
+                if (nchg == 1) n_size[big <= 128 ? 0 : big <= 256 ? 1 : big <= 1024 ? 2 : 3]++;
+            }
+            uint64_t now = SDL_GetTicksNS();
+            if (!last) last = now;
+            if (now - last >= 30000000000ull) {
+                LOG("[rebind] 30 s: %llu draws, %llu bound their sets: %llu first in a pass, %llu other sets / layout, "
+                    "offsets only: %llu one (<=128 B %llu, <=256 %llu, <=1K %llu, more %llu), %llu two, %llu three or more\n",
+                    (unsigned long long)n_draw, (unsigned long long)n_rb, (unsigned long long)n_first, (unsigned long long)n_sets,
+                    (unsigned long long)n_dyn[1], (unsigned long long)n_size[0], (unsigned long long)n_size[1],
+                    (unsigned long long)n_size[2], (unsigned long long)n_size[3], (unsigned long long)n_dyn[2],
+                    (unsigned long long)n_dyn[3]);
+                {   // the (stage, binding) pairs of the single-offset rebinds, most first
+                    char line[512];
+                    int o = 0;
+                    for (int t = 0; t < 8; t++) {
+                        int best = -1;
+                        for (int i = 0; i < 128; i++) if (n_which[i] && (best < 0 || n_which[i] > n_which[best])) best = i;
+                        if (best < 0) break;
+                        o += snprintf(line + o, sizeof line - o, " %s b%d: %llu", best < 64 ? "vs" : "fs", best & 63,
+                                      (unsigned long long)n_which[best]);
+                        n_which[best] = 0;
+                    }
+                    memset(n_which, 0, sizeof n_which);
+                    LOG("[rebind]   one offset moving, by stage / binding:%s\n", line);
+                }
+                n_draw = n_rb = n_first = n_sets = 0;
+                memset(n_dyn, 0, sizeof n_dyn);
+                memset(n_size, 0, sizeof n_size);
+                last = now;
+            }
+        }
+    }
     if (ss_need(SS_SETS, ss.layout == pr->layout && ss.sets[0] == vset && ss.sets[1] == fset && ss.ndyn == nd &&
-                       !memcmp(ss.dyn, dyn, nd * sizeof dyn[0]))) {
+                       !memcmp(ss.dyn, dyn, nd * sizeof dyn[0]) && AB("rebind") != 1)) {
         ss.layout = pr->layout, ss.sets[0] = vset, ss.sets[1] = fset;
         ss.ndyn = nd;
         memcpy(ss.dyn, dyn, nd * sizeof dyn[0]);
@@ -6760,18 +7093,32 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
 // change); LARECOMP_LOG_PACE tags each frame "ab 0/1". Switches: split (no long-pass split), ubo (constant buffers
 // read in place), sgsr (Snapdragon GSR 1 for the scene instead of the setting's upscaler), nobarrier (no barrier at
 // the start of a pass: unsafe, what they cost), copy (feedback copies instead of in-place reads), chunk (submissions
-// every 0.5 ms of translation instead of LARECOMP_VK_CHUNK_US). -1: not under test.
+// every 0.5 ms of translation instead of LARECOMP_VK_CHUNK_US), gcdedup (copy-backs: every ready one compared),
+// rebind / repipe (a measurement: the descriptor sets / the pipeline bound again at draws that would not change them),
+// gcwait (copy-backs of the arena at every wait, not only those that need guest memory). -1: not under test.
+// Up to three switches joined by '+' (LARECOMP_AB=150:gcwait+nobarrier): every combination in turn, switch k on in
+// the stretches whose number has bit k set; the [pace] lines' "ab" is that number (0 .. 2^k - 1).
 int vk_ab(const char *what) {
     int n = ab_n;
-    static char w[32];
+    static char w[3][24];
+    static int nw;
     if (n < 0) {
         const char *e = getenv("LARECOMP_AB"), *c = e ? strchr(e, ':') : NULL;
         n = e ? atoi(e) : 0;
-        snprintf(w, sizeof w, "%s", c ? c + 1 : "");
-        ab_n = n > 0 ? n : 0;
+        for (const char *p = c ? c + 1 : NULL; p && *p && nw < 3;) {
+            const char *q = strchr(p, '+');
+            size_t len = q ? (size_t)(q - p) : strlen(p);
+            snprintf(w[nw++], sizeof w[0], "%.*s", (int)len, p);
+            p = q ? q + 1 : NULL;
+        }
+        ab_n = n > 0 && nw ? n : 0;
+        n = ab_n;
     }
-    if (n <= 0 || (what && strcmp(what, w))) return -1;
-    return (int)((renderer_present_count() / (uint64_t)n) & 1);
+    if (n <= 0) return -1;
+    int phase = (int)((renderer_present_count() / (uint64_t)n) % (uint64_t)(1 << nw));
+    if (!what) return phase;
+    for (int k = 0; k < nw; k++) if (!strcmp(what, w[k])) return (phase >> k) & 1;
+    return -1;
 }
 
 static void split_long_pass(void) {
@@ -6785,7 +7132,7 @@ static void split_long_pass(void) {
     extern bool vk_async_on(void);
     static unsigned n;  // (the clock every 32 draws: a clock read per draw showed up in the profile)
     if (split > 0 && in_pass && !(++n & 31) && AB("split") != 1 && vk_async_on() && last_submit_ns &&
-        SDL_GetTicksNS() - last_submit_ns > (uint64_t)split * 1000)
+        (SDL_GetTicksNS() - last_submit_ns > (uint64_t)split * 1000 || gpu_dry()))
         renderer_submit();
 #endif
 }

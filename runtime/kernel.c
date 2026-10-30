@@ -212,12 +212,35 @@ static KThread *c0_head, *c0_tail;
 static int c0_on = -1;
 static KThread *c0_holder;  // (c0_m) the thread that has core 0, since c0_since
 static uint64_t c0_since;
+// A handoff wakes only the queue's head, on its own condition (KThread.core0_cv): a broadcast on one shared condition
+// woke every waiter of core 0 at each of its ~300 handoffs a second, and all but one went back to sleep (Galaxy S23,
+// Adreno 740, open world: ~18% of core 0's threads' time in the kernel - wakeups, context switches). A thread whose core moved,
+// or a reboot, still wakes every waiter (c0_wake_all). LARECOMP_C0_BROADCAST=1: the shared condition, as before.
+static int c0_bcast = -1;  // (core0_init; not known yet: broadcast)
+static pthread_cond_t *c0_cv_of(KThread *t) { return c0_bcast ? &c0_cv : &t->core0_cv; }
+static void c0_wake_head(void) {  // (c0_m)
+    if (c0_bcast) pthread_cond_broadcast(&c0_cv);
+    else if (c0_head) pthread_cond_signal(&c0_head->core0_cv);
+}
+static void c0_wake_all(void) {  // (c0_m)
+    if (c0_bcast) pthread_cond_broadcast(&c0_cv);
+    else for (KThread *w = c0_head; w; w = w->core0_next) pthread_cond_signal(&w->core0_cv);
+}
 
 // Telemetry (c0_m; issue #41: how much of a frame goes to waiting for core 0, against a slow clock): every 30 s one log
 // line - how often core 0 changed hands, the waits for it (total, longest) and how much of the time it was held.
 static struct { uint64_t start, takes, waited, longest, held; } c0_stat;
+static uint64_t c0_held_total;  // (c0_m) all the time core 0 was held, ever (kernel_core0_busy_ns)
 static void c0_held_until(uint64_t now) {
-    if (c0_holder) c0_stat.held += now - c0_since;
+    if (c0_holder) c0_stat.held += now - c0_since, c0_held_total += now - c0_since;
+}
+// How long core 0 has been held in all, up to now: its threads' combined work (the frame pacer's ADPF hint - the main
+// thread's own busy time leaves out what its job workers did while it waited for core 0)
+uint64_t kernel_core0_busy_ns(void) {
+    pthread_mutex_lock(&c0_m);
+    uint64_t t = c0_held_total + (c0_holder ? plat_now_ns() - c0_since : 0);
+    pthread_mutex_unlock(&c0_m);
+    return t;
 }
 static void c0_stat_log(uint64_t now) {
     if (!c0_stat.start) { c0_stat.start = now; return; }
@@ -260,6 +283,10 @@ static void *core0_slicer(void *arg) {
 static pthread_once_t c0_once = PTHREAD_ONCE_INIT;
 static void core0_init(void) {
     c0_on = !getenv("LARECOMP_NO_CORE0");
+    pthread_mutex_lock(&c0_m);
+    c0_bcast = getenv("LARECOMP_C0_BROADCAST") != NULL;
+    pthread_mutex_unlock(&c0_m);
+    if (c0_on) LOG("[kernel] core 0 handoffs wake %s\n", c0_bcast ? "every waiter (LARECOMP_C0_BROADCAST)" : "the next thread only");
     const char *e = getenv("LARECOMP_C0_SLICE_MS");
     if (e && atoi(e) > 0) c0_slice_ns = (uint64_t)atoi(e) * 1000000;
     if (c0_on && c0_slice_ns) {
@@ -271,6 +298,16 @@ static void core0_init(void) {
 static void core0_acquire(KThread *t) {
     pthread_once(&c0_once, core0_init);
     if (!t || !c0_on) return;
+    {   // core 0's threads on the host's fastest cores, the others off them (plat_core0_affinity); each thread its own
+        int8_t want = __atomic_load_n(&t->core, __ATOMIC_ACQUIRE) == 0 ? 1 : 2;
+        if (t->core0_aff != want) {
+            uint64_t now = plat_now_ns();
+            if (now >= t->core0_aff_retry) {
+                if (plat_core0_affinity(want == 1)) t->core0_aff = want, t->core0_aff_retry = 0;
+                else t->core0_aff_retry = now + 500000000ull;  // (paused: Qualcomm's core_ctl parks the prime core)
+            }
+        }
+    }
     pthread_mutex_lock(&c0_m);
     if (t->core0_evicted) {
         __atomic_store_n(&t->core0_evicted, false, __ATOMIC_RELEASE);
@@ -278,14 +315,14 @@ static void core0_acquire(KThread *t) {
         if (t->core0_held) {
             t->core0_held = false;
             c0_held_until(plat_now_ns()), c0_holder = NULL;
-            pthread_cond_broadcast(&c0_cv);
+            c0_wake_head();
         }
     }
     if (__atomic_load_n(&t->core, __ATOMIC_ACQUIRE) != 0) {
         if (t->core0_held) {
             t->core0_held = false;
             c0_held_until(plat_now_ns()), c0_holder = NULL;
-            pthread_cond_broadcast(&c0_cv);
+            c0_wake_head();
         }
         pthread_mutex_unlock(&c0_m);
         return;
@@ -299,7 +336,7 @@ static void core0_acquire(KThread *t) {
     c0_tail = t;
     uint64_t t0 = plat_now_ns();
     while ((c0_holder || c0_head != t) && __atomic_load_n(&t->core, __ATOMIC_ACQUIRE) == 0 && !g_rt_unwind)
-        pthread_cond_wait(&c0_cv, &c0_m);
+        pthread_cond_wait(c0_cv_of(t), &c0_m);
     uint64_t now = plat_now_ns(), w = now - t0;
     g_blocked_ns += w;
     c0_stat.takes++, c0_stat.waited += w;
@@ -311,7 +348,7 @@ static void core0_acquire(KThread *t) {
     if (c0_tail == t) c0_tail = prev;
     t->core0_next = NULL;
     if (__atomic_load_n(&t->core, __ATOMIC_ACQUIRE) != 0 || g_rt_unwind) {
-        pthread_cond_broadcast(&c0_cv);
+        c0_wake_head();  // (it left the queue without taking core 0: the next one may go)
         pthread_mutex_unlock(&c0_m);
         return;
     }
@@ -337,7 +374,7 @@ static void core0_release(KThread *t) {
     if (t->core0_held) {
         t->core0_held = false;
         if (c0_holder == t) c0_held_until(plat_now_ns()), c0_holder = NULL;
-        pthread_cond_broadcast(&c0_cv);
+        c0_wake_head();
     }
     pthread_mutex_unlock(&c0_m);
 }
@@ -368,6 +405,7 @@ static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
 #ifdef __ANDROID__
+    __atomic_store_n(&t->tid, (int)gettid(), __ATOMIC_RELEASE);
     plat_thread_unpin();  // (not the presenting thread's fast cores: platform.h)
 #endif
     crash_handler_install();
@@ -394,6 +432,9 @@ static void *thread_main(void *arg) {
 static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int prio, int core) {
     KThread *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cond, NULL);
+#ifdef __ANDROID__
+    pthread_cond_init(&t->core0_cv, NULL);
+#endif
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
     t->prio = prio;
@@ -414,6 +455,23 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     pthread_mutex_unlock(&g_klock);
     return t;
 }
+
+#ifdef __ANDROID__
+// The host thread ids of the live guest threads of core 0 (the game's main thread and its job workers take turns
+// there): platform/android.c adds them to the ADPF session, so the governor sees their frame's work as one.
+// (all: every live guest thread, whatever its core)
+int kernel_core0_tids(int32_t *out, int max, bool all) {
+    int n = 0;
+    pthread_mutex_lock(&g_klock);
+    for (KThread *t = g_threads; t && n < max; t = t->anext) {
+        int tid = __atomic_load_n(&t->tid, __ATOMIC_ACQUIRE);
+        if (t->started && !t->finished && tid > 0 && (all || __atomic_load_n(&t->core, __ATOMIC_ACQUIRE) == 0))
+            out[n++] = tid;
+    }
+    pthread_mutex_unlock(&g_klock);
+    return n;
+}
+#endif
 
 // Caller holds g_klock. Core ownership changes only at a guest safe point.
 static uint32_t thread_set_core_mask(KThread *t, int ideal, uint64_t mask) {
@@ -436,7 +494,7 @@ static uint32_t thread_set_core_mask(KThread *t, int ideal, uint64_t mask) {
             __atomic_store_n(&t->core0_evicted, true, __ATOMIC_RELEASE);
             if (c0_nevicted++ == 0) __atomic_fetch_or(&g_fnprof, 2, __ATOMIC_SEQ_CST);
         }
-        pthread_cond_broadcast(&c0_cv);
+        c0_wake_all();  // (a waiter whose core moved leaves the queue)
         pthread_mutex_unlock(&c0_m);
 #endif
     }
@@ -1233,7 +1291,7 @@ void kernel_stop_threads(void (*idle)(void)) {
         pthread_mutex_unlock(&g_klock);
 #ifdef __ANDROID__
         pthread_mutex_lock(&c0_m);
-        pthread_cond_broadcast(&c0_cv);
+        c0_wake_all();
         pthread_mutex_unlock(&c0_m);
 #endif
         if (!live) break;

@@ -1136,6 +1136,7 @@ RT_ON_RESET(desc_pools_reset) {
     while (g_all_desc_pools) {
         NvnDescPool *next = g_all_desc_pools->next;
         free(g_all_desc_pools->entries);
+        free(g_all_desc_pools->gentries);
         free(g_all_desc_pools);
         g_all_desc_pools = next;
     }
@@ -1148,6 +1149,7 @@ static NvnDescPool *desc_pool_init(uint64_t guest, uint64_t pool, uint64_t off, 
     d->addr = HOST(NvnPool, pool)->storage + off;
     d->count = count;
     d->entries = calloc(count, entry);
+    d->gentries = calloc(count, entry);
     pthread_mutex_lock(&g_live_lock);
     d->next = g_all_desc_pools;
     g_all_desc_pools = d;
@@ -1166,13 +1168,20 @@ NVN(nvnTexturePoolInitialize) {
     desc_pool_init(A(0), A(1), A(2), (int)A(3), sizeof(NvnTexEntry), g_texture_pools);
     RET(1);
 }
+#ifdef __ANDROID__
+static void slot_out_retire(void);  // (below: ordered slots)
+#endif
 NVN(nvnTexturePoolFinalize) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     if (!d) return;
 #ifdef __ANDROID__
     vk_async_drain();
 #endif
+#ifdef __ANDROID__
+    slot_out_retire();  // (ordered slots: what the render thread took out, after the drain above)
+#endif
     NvnTexEntry *entries = d->entries;
+    if (d->gentries) memset(d->gentries, 0, sizeof(NvnTexEntry) * (size_t)d->count);  // (ordered slots: the game's copy)
     for (int i = 0; i < d->count; i++) {
         NvnTexture *t = entries[i].tex;
         entries[i].tex = NULL;
@@ -1188,6 +1197,54 @@ NVN(nvnTexturePoolSetDebugLabel) { (void)c; }
 NVN(nvnTexturePoolGetMemoryPool) { RET(G(uint64_t, A(0), 8)); }
 NVN(nvnTexturePoolGetMemoryOffset) { RET(G(uint64_t, A(0), 16)); }
 NVN(nvnTexturePoolGetSize) { RET(G(uint32_t, A(0), 24)); }
+// Ordered slots (Android; LARECOMP_ORDERED_SLOTS=0: off): a slot that changes no longer drains the render thread. The
+// change goes to it as a request in order with the command lists (vk_async_call): the lists queued before still see
+// the old descriptor, the ones after the new one - what the drain made sure of, without the game's thread waiting
+// for the render thread to catch up (the open world rewrites ~150 slots a second; with a drain each, game and render
+// thread ran in series: Galaxy S23, the main thread waiting ~83% of the time). The game's thread compares against
+// its own copy (gentries), the last values it set.
+#ifdef __ANDROID__
+static int ordered_slots(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_ORDERED_SLOTS"); on = !(e && !strcmp(e, "0")); }
+    return on;
+}
+extern bool vk_async_call(void (*fn)(void *), void *arg);
+typedef struct { NvnDescPool *d; int id; NvnTexEntry ne; } TexSet;
+static void texture_retire(NvnTexture *t);
+// The textures the render thread took out of slots, for the game's thread to retire (texture_retire takes g_live_lock,
+// and a game thread may hold that lock while it drains the render thread - nvnTextureFinalize: the render thread
+// must never wait for it). Its own lock, never held across a wait.
+static pthread_mutex_t slot_out_lock = PTHREAD_MUTEX_INITIALIZER;
+static NvnTexture **slot_out;
+static int slot_nout, slot_cap_out;
+static void tex_slot_apply(void *arg) {  // (the render thread's copy of the slot)
+    TexSet *s = arg;
+    NvnTexEntry *e = &((NvnTexEntry *)s->d->entries)[s->id];
+    NvnTexture *old = e->tex;
+    e->tex = s->ne.tex;
+    e->has_view = s->ne.has_view;
+    if (s->ne.has_view) e->view = s->ne.view;
+    if (old && old != s->ne.tex) {
+        pthread_mutex_lock(&slot_out_lock);
+        if (slot_nout == slot_cap_out) slot_out = realloc(slot_out, sizeof *slot_out * (size_t)(slot_cap_out = slot_cap_out ? slot_cap_out * 2 : 256));
+        slot_out[slot_nout++] = old;
+        pthread_mutex_unlock(&slot_out_lock);
+    }
+    free(s);
+}
+static void slot_out_retire(void) {  // (a game thread, holding no lock)
+    NvnTexture *batch[256];
+    for (;;) {
+        int n = 0;
+        pthread_mutex_lock(&slot_out_lock);
+        while (n < 256 && slot_nout) batch[n++] = slot_out[--slot_nout];
+        pthread_mutex_unlock(&slot_out_lock);
+        if (!n) return;
+        for (int i = 0; i < n; i++) texture_retire(batch[i]);
+    }
+}
+#endif
 static void register_texture(Cpu *c) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
@@ -1195,9 +1252,68 @@ static void register_texture(Cpu *c) {
     g_tex_stat_reg++;
     NvnTexEntry *e = &((NvnTexEntry *)d->entries)[id];
     NvnTexture *old = e->tex, *t = HOST(NvnTexture, A(2));
+    // The new entry first (texture, view, the object's own swizzle where it shares its texture with an object of
+    // another - texture_same_storage)
+    NvnTexEntry ne = {.tex = t, .has_view = A(3) != 0};
+    if (ne.has_view) memcpy(&ne.view, AP(3), sizeof ne.view);
+    {
+        const uint8_t *sw = t ? obj_swizzle(A(2)) : NULL;
+        if (sw && memcmp(sw, t->swizzle, 4) && !(ne.has_view && (ne.view.setmask & 8))) {
+            if (!ne.has_view) memset(&ne.view, 0, sizeof ne.view);
+            ne.has_view = true;
+            ne.view.setmask |= 8;
+            memcpy(ne.view.swizzle, sw, 4);
+        }
+    }
 #ifdef __ANDROID__
-    // An asynchronous draw must finish reading the previous descriptor before its slot is replaced.
-    if (old) vk_async_drain();
+    if (ordered_slots()) {
+        slot_out_retire();
+        NvnTexEntry *g = &((NvnTexEntry *)d->gentries)[id];
+        bool gsame = g->tex == t && g->has_view == ne.has_view && (!ne.has_view || !memcmp(&ne.view, &g->view, sizeof ne.view));
+        static uint64_t ost_reg, ost_same, ost_at;
+        ost_reg++;
+        if (gsame) ost_same++;
+        uint64_t onow = plat_now_ns();
+        if (!ost_at) ost_at = onow;
+        else if (onow - ost_at > 30000000000ull) {
+            LOG("[tex] last %.0f s: %llu registrations, %llu the same as before (ordered slots: no drains)\n",
+                (onow - ost_at) / 1e9, (unsigned long long)ost_reg, (unsigned long long)ost_same);
+            ost_reg = ost_same = 0, ost_at = onow;
+        }
+        if (gsame) return;
+        if (g->tex != t && t) {
+            pthread_mutex_lock(&g_live_lock);
+            t->refs++;
+            pthread_mutex_unlock(&g_live_lock);
+        }
+        *g = ne;
+        TexSet *s = malloc(sizeof *s);
+        *s = (TexSet){d, id, ne};
+        if (!vk_async_call(tex_slot_apply, s)) tex_slot_apply(s);
+        return;
+    }
+    // An asynchronous draw must finish reading the previous descriptor before its slot is replaced - unless the slot
+    // gets what it already has (the open world re-registers the same textures all the time: each drain held core 0
+    // while the render thread caught up, game and render thread in series - Galaxy S23, ~85% of the main thread's
+    // time). LARECOMP_REG_SAME_DRAIN=1: a drain for those too, as before.
+    static int same_drain = -1;
+    if (same_drain < 0) same_drain = getenv("LARECOMP_REG_SAME_DRAIN") != NULL;
+    static uint64_t st_reg, st_same, st_drain, st_wait_ns, st_at;
+    st_reg++;
+    bool same = old == t && ne.has_view == e->has_view && (!ne.has_view || !memcmp(&ne.view, &e->view, sizeof ne.view));
+    if (same) st_same++;
+    if (old && !(same && !same_drain)) {
+        extern uint64_t vk_async_drain_unlocked(void);
+        st_drain++, st_wait_ns += vk_async_drain_unlocked();
+    }
+    uint64_t now = plat_now_ns();
+    if (!st_at) st_at = now;
+    else if (now - st_at > 30000000000ull) {
+        LOG("[tex] last %.0f s: %llu registrations, %llu the same as before, %llu drains, waited %.0f ms\n",
+            (now - st_at) / 1e9, (unsigned long long)st_reg, (unsigned long long)st_same, (unsigned long long)st_drain,
+            st_wait_ns / 1e6);
+        st_reg = st_same = st_drain = st_wait_ns = 0, st_at = now;
+    }
 #endif
     if (old != t) {
         pthread_mutex_lock(&g_live_lock);
@@ -1206,17 +1322,8 @@ static void register_texture(Cpu *c) {
         pthread_mutex_unlock(&g_live_lock);
         if (old) texture_retire(old);
     }
-    e->has_view = A(3) != 0;
-    if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
-    {   // the object's own swizzle, where it shares its texture with an object of another (texture_same_storage)
-        const uint8_t *sw = t ? obj_swizzle(A(2)) : NULL;
-        if (sw && memcmp(sw, t->swizzle, 4) && !(e->has_view && (e->view.setmask & 8))) {
-            if (!e->has_view) memset(&e->view, 0, sizeof e->view);
-            e->has_view = true;
-            e->view.setmask |= 8;
-            memcpy(e->view.swizzle, sw, 4);
-        }
-    }
+    e->has_view = ne.has_view;
+    if (ne.has_view) e->view = ne.view;
     static int watch_id = -2;  // LARECOMP_WATCH_TEXID=<hex id>: its registrations (texture, view)
     if (watch_id == -2) watch_id = getenv("LARECOMP_WATCH_TEXID") ? (int)strtol(getenv("LARECOMP_WATCH_TEXID"), NULL, 16) : -1;
     if (id == watch_id || (watch_id == 0x7fffffff && t && t->width == 320 && t->height == 180 && t->levels == 5))  // (7fffffff: the bloom chain)
@@ -1239,9 +1346,31 @@ NVN(nvnSamplerPoolGetSize) { RET(G(uint32_t, A(0), 24)); }
 // A sampler slot rewritten: the render thread may still have draws queued that read the old one (vulkan/async.c) -
 // BOTW recycles slots without a fence wait between (its bloom's mip chain then read a recycled 0..0 LOD clamp: only
 // level 0, a blocky glow around the Sheikah lights). Like a texture slot replaced (register_texture): drain first.
-static void register_sampler(NvnSamplerDesc *e, const NvnSamplerDesc *n) {
+#ifdef __ANDROID__
+typedef struct { NvnSamplerDesc *e; NvnSamplerDesc v; } SmpSet;
+static void smp_slot_apply(void *arg) {
+    SmpSet *s = arg;
+    *s->e = s->v;
+    free(s);
+}
+#endif
+static void register_sampler(NvnDescPool *d, int id, const NvnSamplerDesc *n) {
+    NvnSamplerDesc *e = &((NvnSamplerDesc *)d->entries)[id];
     NvnSamplerDesc v = *n;
     v.backend = NULL;  // (the VkSampler is made per slot, from its fields)
+#ifdef __ANDROID__
+    if (ordered_slots()) {  // (as register_texture: the game's copy compared, the change queued in order)
+        NvnSamplerDesc *g = &((NvnSamplerDesc *)d->gentries)[id];
+        NvnSamplerDesc o = *g;
+        o.backend = NULL;
+        if (!memcmp(&o, &v, sizeof v)) return;
+        *g = v;
+        SmpSet *s = malloc(sizeof *s);
+        *s = (SmpSet){e, v};
+        if (!vk_async_call(smp_slot_apply, s)) smp_slot_apply(s);
+        return;
+    }
+#endif
     NvnSamplerDesc o = *e;
     o.backend = NULL;
     if (!memcmp(&o, &v, sizeof v)) return;
@@ -1255,7 +1384,7 @@ static void register_sampler(NvnSamplerDesc *e, const NvnSamplerDesc *n) {
 NVN(nvnSamplerPoolRegisterSampler) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
-    if (id >= 0 && id < d->count) register_sampler(&((NvnSamplerDesc *)d->entries)[id], HOST(NvnSamplerDesc, A(2)));
+    if (id >= 0 && id < d->count) register_sampler(d, id, HOST(NvnSamplerDesc, A(2)));
     if (getenv("LARECOMP_LOG_SMPREG") && id >= 0 && id < d->count) {  // every registration (diagnosis)
         const NvnSamplerDesc *sd = &((NvnSamplerDesc *)d->entries)[id];
         LOG("[nvn] RegisterSampler %d <- object %llx wrap %u %u %u min %u lod %.1f..%.1f (lr %llx, thread %d)\n", id, (unsigned long long)A(2), sd->wrap[0], sd->wrap[1],
@@ -1273,7 +1402,7 @@ NVN(nvnSamplerPoolRegisterSamplerBuilder) {
     int id = (int)A(1);
     if (id >= 0 && id < d->count) {
         NvnSamplerDesc from = sampler_desc_from_builder(AP(2));  // (the packed builder state)
-        register_sampler(&((NvnSamplerDesc *)d->entries)[id], &from);
+        register_sampler(d, id, &from);
     }
     if (getenv("LARECOMP_LOG_SMPREG") && id >= 0 && id < d->count)
         LOG("[nvn] RegisterSamplerBuilder %d (lr %llx)\n", id, (unsigned long long)c->x[30]);
