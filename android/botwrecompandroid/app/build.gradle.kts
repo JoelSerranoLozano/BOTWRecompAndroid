@@ -27,8 +27,8 @@ android {
         if (!manifestPlaceholders.containsKey("appLabel")) manifestPlaceholders["appLabel"] = "BOTWRecompAndroid"
         minSdk = 30
         targetSdk = 36
-        versionCode = 22
-        versionName = "0.2.2-beta"
+        versionCode = 24
+        versionName = "0.2.4-beta"
         ndk {
             abiFilters += "arm64-v8a"
         }

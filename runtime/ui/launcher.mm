@@ -188,6 +188,17 @@ static int main_version(const std::string &main_path) {
 
 static const char *version_name(int v) { return v == 190 ? "1.9.0" : v == 182 ? "1.8.2" : v == 160 ? "1.6.0" : "1.0.0"; }
 
+// The player's romfs/ the files of root use in place (root/romfs.link: main.c reads it too), "" when they're copied
+static std::string romfs_link_target(const std::string &root) {
+    FILE *f = fopen((root + "/romfs.link").c_str(), "rb");
+    if (!f) return "";
+    char t[1024];
+    size_t n = fread(t, 1, sizeof t - 1, f);
+    fclose(f);
+    while (n && (t[n - 1] == '\n' || t[n - 1] == '\r')) n--;
+    return std::string(t, n);
+}
+
 // The copied game files alone ("" = there), without the game code built from them: of a version this app runs, the
 // one whose folder root is (runtime/paths.h)
 static std::string check_copied_files(const std::string &root) {
@@ -196,6 +207,9 @@ static std::string check_copied_files(const std::string &root) {
     if (!v || (want && v != want)) return "Wrong game version (needs v1.0.0, v1.6.0, v1.8.2 or v1.9.0)";
     // (the game reads its data through romfs.bin alone: on Android it's built straight from the picked folder, and romfs/
     // holds only the movies, opened by path)
+    std::string linked = romfs_link_target(root);
+    if (!linked.empty())  // (used in place: the player's own romfs/, runtime/services/fs.c)
+        return file_exists(linked + "/System/Version.txt") ? "" : "The game files folder was moved or can't be read";
     if (!file_exists(root + "/romfs.bin")) return "Game data missing";
     char why[128];  // (a copy cut short: the game would abort at start, runtime/romfs_build.c)
     if (!romfs_image_ok((root + "/romfs.bin").c_str(), why, sizeof why)) return "Game data incomplete: set up the game files again";
@@ -515,7 +529,7 @@ static void android_call_int(const char *method, int v) {  // (one int argument)
 // (BOTWRecompAndroidActivity pickLogFolder / openLog), where a file manager can open it - Android/data/ is out of its reach
 extern "C" void android_log_file(bool on);
 extern "C" bool vk_adreno_8xx(const char *name);  // (Driver compatibility's Automatic: runtime/nvn/vulkan/device.c)
-extern "C" bool vk_adreno_inplace_auto(const char *name);  // (the in-place reads' Automatic: also the Adreno 740)
+extern "C" bool vk_turnip_path_on(int setting);  // (gpu_heap / inplace_reads' Automatic for this GPU: device.c)
 extern "C" bool vk_lrz_at_start(void);
 extern "C" const char *vk_gpu_name(void);
 extern "C" const char *vk_driver_rejected(void);  // (runtime/nvn/vulkan/android_driver.c)
@@ -1339,6 +1353,30 @@ static void switch_to_version(int v) {
 #endif
 }
 
+// The setup's Game code (Native or Recompiled) into the version it set up: each version keeps its own settings, so a
+// setup of 1.8.2 from 1.9.0's page with Native chosen restarted into 1.8.2's - or a copy of 1.0.0's - with Recompiled,
+// and the start screen asked to build the game code the setup had just skipped (players' reports, 2026-10-28)
+static void carry_game_code(int version) {
+    char vr[1024], main_root[1024];
+    if (!rt_version_root(version, vr, sizeof vr) || !rt_version_root(100, main_root, sizeof main_root)) return;
+    std::string path = std::string(vr) + "/botwrecompandroid.ini", text, line;
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) f = fopen((std::string(main_root) + "/botwrecompandroid.ini").c_str(), "rb");  // (as paths.c version_seed)
+    if (f) {
+        for (int ch; (ch = fgetc(f)) != EOF;) {
+            line += (char)ch;
+            if (ch != '\n') continue;
+            if (line.compare(0, 11, "native_code")) text += line;
+            line.clear();
+        }
+        if (!line.empty() && line.compare(0, 11, "native_code")) text += line + "\n";
+        fclose(f);
+    }
+    text += std::string("native_code = ") + (g_settings.native_code ? "1" : "0") + "\n";
+    f = fopen(path.c_str(), "wb");
+    if (f) fputs(text.c_str(), f), fclose(f);
+}
+
 // The Game Files page's game versions: the one running, the others set up (choosing one starts the app again in it),
 // the ones not set up yet greyed - the files folder below sets them up. focus: the running one takes the cursor.
 static void version_rows(bool busy, bool focus) {
@@ -1446,7 +1484,7 @@ static void prelaunch_tab(float sc) {
             ImGui::TextDisabled("%s", tr("These options are for Turnip: the driver in use takes the safer paths anyway."));
         ImGui::Spacing();
         ImGui::Text("%s", tr("Game memory on the GPU (Turnip)"));
-        changed |= tri("heap", &g_settings.gpu_heap, a8);
+        changed |= tri("heap", &g_settings.gpu_heap, vk_turnip_path_on(-1));
         ImGui::TextDisabled("%s", tr("On: the game's memory is mapped straight into the GPU's, the fastest way. Off: what each "
                                   "frame uses is copied instead - it draws right where the fast way doesn't, but this game "
                                   "runs at about half the frame rate (15 fps instead of 35 on an Adreno 830). Automatic: on "
@@ -1454,7 +1492,7 @@ static void prelaunch_tab(float sc) {
                                   "the game starts."));
         ImGui::Spacing();
         ImGui::Text("%s", tr("Draw-target reads in place (Turnip)"));
-        changed |= tri("inplace", &g_settings.inplace_reads, vk_adreno_inplace_auto(vk_gpu_name()));
+        changed |= tri("inplace", &g_settings.inplace_reads, vk_turnip_path_on(-1));
         ImGui::TextDisabled("%s", tr("On: decals and effects read the image they draw on as it is, the fastest way. Off: a copy "
                                   "of it each time, slower (fewer fps) but by the Vulkan rules. Automatic: on for Adreno 8xx "
                                   "GPUs, off for the others. Applies when the game starts."));
@@ -1818,7 +1856,10 @@ extern "C" void launcher_run(const char *root) {
             g_set_up_version = 0;
             bool failed = g_job_failed;
             pthread_mutex_unlock(&g_lock);
-            if (set_up && set_up != rt_game_version()) switch_to_version(set_up);  // (set up beside this one: played now)
+            if (set_up && set_up != rt_game_version()) {  // (set up beside this one: played now)
+                carry_game_code(set_up);
+                switch_to_version(set_up);
+            }
             status = check_game_files(g_root);
             // (a failure stays on the page with its cause: with this version's files ready, a setup of another folder
             // that failed went back to the start screen without a word)
@@ -2157,10 +2198,26 @@ extern "C" void launcher_run(const char *root) {
                         status = check_game_files(g_root);
                     }
                 }
+                {   // copied, or read where they are (the romfs/: services/fs.c romfs.link; the exefs/ is copied, small)
+                    static const char *const ways[] = {"Copy them", "Use them in place"};
+                    int w = g_settings.files_in_place ? 1 : 0;
+                    if (busy) opt_disable_next();
+                    opt_choice("Game files", &w, ways, 2, 0,
+                               "Copy them: the setup copies the game data (about 16 GB) into BOTWRecompAndroid's folder - "
+                               "your folder can be moved or deleted afterwards.\n\n"
+                               "Use them in place: the game reads its data from your folder, no copy - it saves the space "
+                               "and the wait. It needs the permission to access all files (Android asks), and the folder "
+                               "must stay where it is: moved or deleted, the game files have to be set up again.");
+                    if ((w == 1) != g_settings.files_in_place) {
+                        g_settings.files_in_place = w == 1;
+                        settings_save();
+                    }
+                }
 #endif
                 if (busy) opt_disable_next();
 #ifdef __ANDROID__
-                if (opt_action("Game files folder", src_v.c_str(), src_d.c_str(), true)) android_call("pickGameFolder");
+                if (opt_action("Game files folder", src_v.c_str(), src_d.c_str(), true))
+                    android_call(g_settings.files_in_place ? "pickGameFolderInPlace" : "pickGameFolder");
 #else
                 if (opt_action("Game files folder", src_v.c_str(), src_d.c_str(), true))
                     SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);

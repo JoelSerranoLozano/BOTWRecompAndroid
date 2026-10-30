@@ -175,6 +175,7 @@ static bool compat_group(VkExtensionProperties *ep, uint32_t ne, uint32_t api, i
 }
 
 static bool env_on(const char *name) { const char *v = getenv(name); return v && atoi(v); }
+bool vk_driver_is_turnip(void);  // (defined below: the gpu-heap automatic looks at the driver before that)
 
 // ---- synchronization2 without it (Mali's older drivers): Vulkan 1.0's barriers, submissions and timestamps. The
 // stage / access bits below 32 are 1.0's own; the split-up ones above map to the 1.0 bit they came from. (From LAS
@@ -1206,6 +1207,7 @@ void vk_frame_end(const char *shot_path) {
     if (shot_path) {
         vk_wait_seq(seq);
         uint32_t w = g_vk.sc_extent.width, h = g_vk.sc_extent.height;
+        vk_readback_ready((uint64_t)w * h * 4);
         uint8_t *px = shot.ptr;
         bool bgr = g_vk.sc_format == VK_FORMAT_B8G8R8A8_UNORM || g_vk.sc_format == VK_FORMAT_B8G8R8A8_SRGB;
         for (uint64_t i = 0; bgr && i < (uint64_t)w * h; i++) { uint8_t t = px[i * 4]; px[i * 4] = px[i * 4 + 2]; px[i * 4 + 2] = t; }
@@ -1403,6 +1405,10 @@ void backend_present(NvnTexture *t) {
     // LARECOMP_DEBUG_FRAMES=<n> (with LARECOMP_DEBUG_FRAME / F9): dump n consecutive frames (build/pass_<frame>_NNN.png)
     static long debug_n = -1;
     if (debug_n < 0) { const char *e = getenv("LARECOMP_DEBUG_FRAMES"); debug_n = e && atol(e) > 1 ? atol(e) : 1; }
+    {   // (the debug frame that just ended: its LARECOMP_DEBUG_PICK points, exec.c)
+        extern void vk_pick_report(void);
+        if (g_debug_frame) vk_pick_report();
+    }
     g_debug_frame = debug_at && total_frames >= (uint64_t)debug_at && total_frames < (uint64_t)debug_at + (uint64_t)debug_n;
     {   // LARECOMP_GPUPROF_AT=<frame>[,<frame>...]: GPU time per pass of those frames ("[gpuprof]" in the log)
         extern bool g_gpuprof_frame;
@@ -1711,18 +1717,15 @@ bool vk_adreno_7xx(const char *name) {  // (as vk_adreno_8xx)
     return n >= 700 && n < 800;
 }
 // A Turnip path's setting (-1 Automatic, 1 on, 0 off) for this GPU
-bool vk_turnip_path_on(int setting) { return setting < 0 ? vk_adreno_8xx(g_vk.props.deviceName) : setting != 0; }
-// Draw-target reads in place (exec.c resolve_feedback): Automatic is on for the Adreno 740 too, where they were checked
-// with the sync lag off - water, ground, decals and lighting right - and saved the frame's 11 feedback copies: 53.9 ->
-// 47.8 ms a frame, +12% (S23, 1.0.0, 2026-10-29). Not the other 7xx: a 750 drew LAS's text and colours wrong with
-// LASRecompAndroid's fast paths.
-bool vk_adreno_inplace_auto(const char *name) {
-    const char *a = name ? strstr(name, "Adreno") : NULL;
-    if (!a) return false;
-    while (*a && (*a < '0' || *a > '9')) a++;
-    return vk_adreno_8xx(name) || atoi(a) == 740;
+bool vk_turnip_path_on(int setting) {
+    if (setting >= 0) return setting != 0;
+    if (vk_adreno_8xx(g_vk.props.deviceName)) return true;
+    // Turnip names an Adreno 732 "Adreno (TM) 735", and vk_adreno_8xx takes that for a pre-8xx GPU: the heap stayed
+    // off, and the game's text glyphs (a buffer ~2.7 GB into the 3 GB heap, outside any storage descriptor's reach)
+    // read as zeros - every menu, dialogue and item name blank. A Turnip that can place the heap in GPU memory is
+    // meant to be on for those paths: without it the game is unreadable on such a GPU.
+    return g_vk.map_placed && vk_driver_is_turnip();
 }
-bool vk_turnip_inplace_on(int setting) { return setting < 0 ? vk_adreno_inplace_auto(g_vk.props.deviceName) : setting != 0; }
 static bool g_lrz_at_start = true;
 bool vk_lrz_at_start(void) { return g_lrz_at_start; }  // (the start screen: a change needs a restart)
 const char *vk_gpu_name(void) { return g_vk.props.deviceName; }
